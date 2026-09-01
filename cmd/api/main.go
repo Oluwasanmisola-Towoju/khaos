@@ -20,6 +20,9 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to open DB: %v", err)
 	}
+	// Tune the connection pool
+	db.SetMaxOpenConns(80)
+	db.SetMaxIdleConns(80)
 	defer db.Close()
 
 	if err := db.Ping(); err != nil {
