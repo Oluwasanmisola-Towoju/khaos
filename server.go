@@ -3,40 +3,63 @@ package khaos
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log"
 	"net/http"
+	"strings"
 	"time"
 )
 
-const (
-	defaultWorkerCount  = 8
-	defaultBatchTimeout = 5 * time.Second
-	defaultReadTimeout  = 30 * time.Second
-	defaultWriteTimeout = 30 * time.Second
-	defaultIdleTimeout  = 60 * time.Second
-	defaultMaxBodyBytes = int64(10 << 20)
-)
+// -----------------------------------------------------------------------
+// Wire types
+// -----------------------------------------------------------------------
 
-// ServerConfig configures the HTTP listener and execution defaults for the batch API.
-type ServerConfig struct {
-	Addr         string
-	WorkerCount  int
-	BatchTimeout time.Duration
-	ReadTimeout  time.Duration
-	WriteTimeout time.Duration
-	IdleTimeout  time.Duration
-	MaxBodyBytes int64
+type BatchRequestItem struct {
+	SeqID         uint64       `json:"seq_id"`
+	OperationType string       `json:"operation_type"` // "READ" | "WRITE" | "DELETE"
+	RiderID       string       `json:"rider_id"`
+	Payload       *RiderUpdate `json:"payload,omitempty"` // required only for WRITE
 }
 
-// Server exposes the batch endpoint and wraps the Khaos execution pipeline.
+type BatchResponseItem struct {
+	SeqID  uint64 `json:"seq_id"`
+	Result any    `json:"result,omitempty"`
+	Error  string `json:"error,omitempty"`
+}
+
+// -----------------------------------------------------------------------
+// Server Config & Struct
+// -----------------------------------------------------------------------
+
 type Server struct {
-	httpServer   *http.Server
 	resolver     HazardResolver
 	storage      StorageEngine
 	workerCount  int
 	batchTimeout time.Duration
+	httpServer   *http.Server
 }
 
+type ServerConfig struct {
+	Addr         string        // e.g. ":8080"
+	WorkerCount  int           // workers per batch; default 8
+	BatchTimeout time.Duration // per-batch execution budget; default 5s
+	ReadTimeout  time.Duration // default 10s
+	WriteTimeout time.Duration // default 15s
+	IdleTimeout  time.Duration // default 60s
+	MaxBodyBytes int64         // default 2 MiB
+}
+
+const (
+	defaultWorkerCount  = 8
+	defaultBatchTimeout = 5 * time.Second
+	defaultReadTimeout  = 10 * time.Second
+	defaultWriteTimeout = 15 * time.Second
+	defaultIdleTimeout  = 60 * time.Second
+	defaultMaxBodyBytes = 2 << 20 // 2 MiB
+)
+
+// NewServer constructs a Server backed by the provided StorageEngine.
 func NewServer(cfg ServerConfig, storage StorageEngine) *Server {
 	if cfg.WorkerCount <= 0 {
 		cfg.WorkerCount = defaultWorkerCount
@@ -78,60 +101,208 @@ func NewServer(cfg ServerConfig, storage StorageEngine) *Server {
 	return s
 }
 
-func (s *Server) Run(ctx context.Context) error {
-	if s == nil || s.httpServer == nil {
-		return nil
-	}
-
-	go func() {
-		<-ctx.Done()
-		_ = s.httpServer.Close()
-	}()
-
-	if err := s.httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		return err
-	}
-	return nil
-}
-
 func (s *Server) withMaxBody(limit int64, next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if limit > 0 && r.ContentLength > limit {
-			http.Error(w, fmt.Sprintf("request body exceeds %d bytes", limit), http.StatusRequestEntityTooLarge)
-			return
-		}
-		if limit > 0 {
-			r.Body = http.MaxBytesReader(w, r.Body, limit)
-		}
+		r.Body = http.MaxBytesReader(w, r.Body, limit)
 		next(w, r)
 	}
 }
 
-func (s *Server) handleBatch(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
+// -----------------------------------------------------------------------
+// Request -> Operation translation
+// -----------------------------------------------------------------------
+
+func translateRequest(items []BatchRequestItem) ([]Operation, error) {
+	n := len(items)
+	ops := make([]Operation, n)
+	seen := make([]bool, n)
+
+	for _, item := range items {
+		if item.SeqID >= uint64(n) {
+			return nil, fmt.Errorf("seq_id %d is out of range for a batch of size %d", item.SeqID, n)
+		}
+		if seen[item.SeqID] {
+			return nil, fmt.Errorf("duplicate seq_id %d", item.SeqID)
+		}
+		seen[item.SeqID] = true
+
+		opType, err := parseOperationType(item.OperationType)
+		if err != nil {
+			return nil, fmt.Errorf("seq_id %d: %w", item.SeqID, err)
+		}
+		if item.RiderID == "" {
+			return nil, fmt.Errorf("seq_id %d: rider_id is required", item.SeqID)
+		}
+
+		op := Operation{SeqID: item.SeqID, Key: item.RiderID, Type: opType}
+
+		if opType == OpWrite {
+			if item.Payload == nil {
+				return nil, fmt.Errorf("seq_id %d: payload is required for a WRITE operation", item.SeqID)
+			}
+			op.Value = *item.Payload
+		}
+
+		ops[item.SeqID] = op
 	}
 
-	var req struct {
-		Operations []Operation `json:"operations"`
+	for i, wasSeen := range seen {
+		if !wasSeen {
+			return nil, fmt.Errorf("missing seq_id %d: batch must be dense and zero-indexed", i)
+		}
 	}
 
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, fmt.Sprintf("invalid JSON: %v", err), http.StatusBadRequest)
-		return
-	}
+	return ops, nil
+}
 
-	if len(req.Operations) == 0 {
-		http.Error(w, "no operations provided", http.StatusBadRequest)
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(map[string]any{
-		"accepted": true,
-		"count":    len(req.Operations),
-	}); err != nil {
-		http.Error(w, fmt.Sprintf("failed to encode response: %v", err), http.StatusInternalServerError)
+func parseOperationType(raw string) (OperationType, error) {
+	switch strings.ToUpper(strings.TrimSpace(raw)) {
+	case "READ":
+		return OpRead, nil
+	case "WRITE":
+		return OpWrite, nil
+	case "DELETE":
+		return OpDelete, nil
+	default:
+		return 0, fmt.Errorf("unknown operation_type %q (must be READ, WRITE, or DELETE)", raw)
 	}
 }
+
+// -----------------------------------------------------------------------
+// Handler
+// -----------------------------------------------------------------------
+
+func (s *Server) handleBatch(w http.ResponseWriter, r *http.Request) {
+	var items []BatchRequestItem
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&items); err != nil {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("invalid JSON body: %v", err))
+		return
+	}
+
+	if len(items) == 0 {
+		writeJSON(w, http.StatusOK, []BatchResponseItem{})
+		return
+	}
+
+	ops, err := translateRequest(items)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	all, runnable, err := s.resolver.Build(ops)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("failed to build dependency graph: %v", err))
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), s.batchTimeout)
+	defer cancel()
+
+	rob := NewInOrderReorderBuffer()
+	results := rob.Drain(ctx, len(all))
+
+	pool := NewConcurrentWorkerPool(rob, s.workerCount)
+
+	runErrCh := make(chan error, 1)
+	go func() {
+		runErrCh <- pool.Run(ctx, s.storage, runnable)
+	}()
+
+	responses := make([]BatchResponseItem, 0, len(all))
+
+drainLoop:
+	for {
+		select {
+		case op, ok := <-results:
+			if !ok {
+				break drainLoop
+			}
+			item := BatchResponseItem{SeqID: op.SeqID, Result: op.Result}
+			if op.Err != nil {
+				item.Error = op.Err.Error()
+			}
+			responses = append(responses, item)
+
+		case <-ctx.Done():
+			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				writeError(w, http.StatusGatewayTimeout,
+					fmt.Sprintf("batch execution exceeded %s timeout", s.batchTimeout))
+			} else {
+				log.Printf("khaos: batch request context ended early: %v", ctx.Err())
+			}
+			return
+		}
+	}
+
+	if err := <-runErrCh; err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("worker pool error: %v", err))
+		return
+	}
+
+	writeJSON(w, http.StatusOK, responses)
+}
+
+// -----------------------------------------------------------------------
+// Response helpers
+// -----------------------------------------------------------------------
+
+func writeJSON(w http.ResponseWriter, status int, payload any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	if err := json.NewEncoder(w).Encode(payload); err != nil {
+		log.Printf("khaos: failed to encode JSON response: %v", err)
+	}
+}
+
+func writeError(w http.ResponseWriter, status int, message string) {
+	writeJSON(w, status, struct {
+		Error string `json:"error"`
+	}{Error: message})
+}
+
+// -----------------------------------------------------------------------
+// Lifecycle: start and graceful shutdown
+// -----------------------------------------------------------------------
+
+func (s *Server) Run(ctx context.Context) error {
+	serveErrCh := make(chan error, 1)
+	go func() {
+		serveErrCh <- s.httpServer.ListenAndServe()
+	}()
+
+	select {
+	case err := <-serveErrCh:
+		if errors.Is(err, http.ErrServerClosed) {
+			return nil
+		}
+		return fmt.Errorf("khaos: http server error: %w", err)
+
+	case <-ctx.Done():
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := s.Shutdown(shutdownCtx); err != nil {
+			return fmt.Errorf("khaos: graceful shutdown failed: %w", err)
+		}
+		if err := <-serveErrCh; err != nil && !errors.Is(err, http.ErrServerClosed) {
+			return fmt.Errorf("khaos: http server error during shutdown: %w", err)
+		}
+		return nil
+	}
+}
+
+func (s *Server) Shutdown(ctx context.Context) error {
+	if err := s.httpServer.Shutdown(ctx); err != nil {
+		return fmt.Errorf("khaos: http server shutdown: %w", err)
+	}
+	if closer, ok := s.storage.(*PostgresStorageEngine); ok {
+		if err := closer.Close(); err != nil {
+			return fmt.Errorf("khaos: closing storage engine: %w", err)
+		}
+	}
+	return nil
+}
+
+var _ interface{ Close() error } = (*PostgresStorageEngine)(nil)
