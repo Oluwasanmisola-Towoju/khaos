@@ -192,28 +192,12 @@ if (realpath($_SERVER['SCRIPT_FILENAME'] ?? '') === __FILE__) {
     $dispatcher = new KhaosDispatcher($apiUrl);
 
     $dispatcher->addRiderUpdate(
-        riderId: 'rider-a1b2c3',
-        orderId: 'order-1001',
+        riderId: '11111111-1111-1111-1111-111111111111',
+        orderId: '22222222-2222-2222-2222-222222222222',
         lat: 6.5244,
         lng: 3.3792,
         status: 'EN_ROUTE',
         eta: 12,
-    );
-    $dispatcher->addRiderUpdate(
-        riderId: 'rider-d4e5f6',
-        orderId: 'order-1002',
-        lat: 6.4550,
-        lng: 3.3941,
-        status: 'AT_VENDOR',
-        eta: 25,
-    );
-    $dispatcher->addRiderUpdate(
-        riderId: 'rider-g7h8i9',
-        orderId: 'order-1003',
-        lat: 6.6018,
-        lng: 3.3515,
-        status: 'ARRIVED',
-        eta: 0,
     );
 
     echo "Dispatching {$dispatcher->pendingCount()} rider updates to {$apiUrl}...\n";

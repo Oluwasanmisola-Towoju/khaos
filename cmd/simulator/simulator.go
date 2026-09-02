@@ -83,9 +83,9 @@ func buildBatch(rng *rand.Rand, size int, clientID int) []batchRequestItem {
 		batch[i] = batchRequestItem{
 			SeqID:         uint64(i),
 			OperationType: "WRITE",
-			RiderID:       fmt.Sprintf("sim-client-%d-rider-%d", clientID, i),
+			RiderID: fmt.Sprintf("00000000-0000-0000-0000-%012d", clientID*1000+i),
 			Payload: &riderUpdatePayload{
-				OrderID:       fmt.Sprintf("sim-client-%d-order-%d", clientID, i),
+				OrderID:       fmt.Sprintf("11111111-1111-1111-1111-%012d", clientID*1000+i),
 				Latitude:      -90 + rng.Float64()*180,
 				Longitude:     -180 + rng.Float64()*360,
 				CurrentStatus: riderStatuses[rng.Intn(len(riderStatuses))],
