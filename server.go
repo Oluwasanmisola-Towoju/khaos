@@ -32,6 +32,10 @@ type BatchResponseItem struct {
 // Server Config & Struct
 // -----------------------------------------------------------------------
 
+type closableStorage interface {
+	Close() error
+}
+
 type Server struct {
 	resolver     HazardResolver
 	storage      StorageEngine
@@ -305,4 +309,4 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	return nil
 }
 
-var _ interface{ Close() error } = (*PostgresStorageEngine)(nil)
+var _ closableStorage = (*PostgresStorageEngine)(nil)
